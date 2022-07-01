@@ -11,14 +11,17 @@
 
 #include <MNN/MNNForwardType.h>
 #include <MNN/ErrorCode.hpp>
+#include <MNN/Tensor.hpp>
 #include <map>
+#include <memory>
+#include <vector>
 #include "Command.hpp"
 #include "NonCopyable.hpp"
-#include <future>
 
 namespace MNN {
 
 struct Op;
+struct GpuLibrary;
 class Execution;
 
 class Runtime;
@@ -30,9 +33,9 @@ public:
         /** forward type. */
         MNNForwardType type = MNN_FORWARD_CPU;
         /** numThread for CPU . number of threads.  gpuMode for GPU only. tuning/memory Mode setting. */
-        union {
+        struct {
             int numThread = 4;
-            int gpuMode;
+            int gpuMode = 4;
         };
         /** user data. */
         BackendConfig* user = NULL;
@@ -86,6 +89,17 @@ public:
     virtual ~Backend() = default;
 
 public:
+    /**
+     * @brief measure the cost for op with input and output tensors.
+     * @param inputs    input tensors.
+     * @param outputs   output tensors.
+     * @param op        given op.
+     * @return std::make_pair(timeDelayInMs, support);
+     */
+    virtual std::pair<float, bool> onMeasure(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                                             const MNN::Op* op) {
+        return std::make_pair(0.0f, false);
+    }
 
     /**
      * @brief create execution for op with input and output tensors.
@@ -126,7 +140,7 @@ public:
      * @param storageType   buffer storage type.
      * @return success or not.
      */
-    MNN_PUBLIC bool onAcquireBuffer(const Tensor* tensor, StorageType storageType);
+    virtual bool onAcquireBuffer(const Tensor* tensor, StorageType storageType) = 0;
 
     /**
      * @brief release buffer of tensor for given storage type.
@@ -134,20 +148,7 @@ public:
      * @param storageType   buffer storage type.
      * @return success or not.
      */
-    MNN_PUBLIC bool onReleaseBuffer(const Tensor* tensor, StorageType storageType);
-
-    class MemObj {
-    public:
-        MemObj() {}
-        virtual ~ MemObj() {}
-    };
-    /**
-     * @brief allocate buffer of tensor for given storage type.
-     * @param tensor        buffer provider.
-     * @param storageType   buffer storage type.
-     * @return MemObj for release, if failed, return nullptr.
-     */
-    virtual MemObj* onAcquire(const Tensor* tensor, StorageType storageType) = 0;
+    virtual bool onReleaseBuffer(const Tensor* tensor, StorageType storageType) = 0;
 
     /**
      * @brief clear all dynamic buffers.
@@ -162,6 +163,15 @@ public:
      */
     virtual void onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) const = 0;
 
+    /**
+     * @brief get runtime datatype.
+     * @param op      the run op.
+     * @param qtype    quant data type.
+     * @return support type for op.
+     */
+    virtual halide_type_t getRunType(const MNN::Op* op, halide_type_t qtype, halide_type_t rtype) {
+        return rtype;
+    }
 public:
     /**
      * @brief get forward type.
@@ -170,7 +180,7 @@ public:
     inline MNNForwardType type() const {
         return mType;
     }
-
+    
 public:
     /**
      * @brief get Gpu Tensor map host ptr/ unmap
@@ -183,10 +193,7 @@ public:
         return false;
     }
 
-    virtual int onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTensor) {
-        return 0;
-    }
-
+    
 private:
     const MNNForwardType mType;
 };
@@ -238,38 +245,6 @@ public:
     virtual std::pair<const void*, size_t> onGetCache() {
         return std::make_pair(nullptr, 0);
     }
-    virtual int onGetRuntimeStatus(RuntimeStatus statusEnum) const {
-        return 0;
-    }
-    struct OpInfo {
-        bool initCostLong;
-        float exeutionCost; // In ms
-        float initCost; // In ms
-    };
-    /**
-     * @brief measure the cost for op with input and output tensors.
-     * @param inputs    input tensors.
-     * @param outputs   output tensors.
-     * @param op        given op.
-     * @param dstInfo   the Info for write.
-     * @return support the op or not;
-     */
-    virtual bool onMeasure(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
-                                             const MNN::Op* op, OpInfo& dstInfo) const {
-        return true;
-    }
-    
-    // FIXME: Temply use to mask cache valid, in future will delete
-    virtual void onMaskOpReady(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
-                               const MNN::Op* op) {
-        // Do nothing
-    }
-    // FIXME: Temply used, in future will refract
-    bool hasAsyncWork() const;
-    void setAsyncWork(std::future<int>&& future);
-    MNN_PUBLIC void waitAsyncWork();
-private:
-    std::future<int> mFuture;
 };
 
 /** abstract Runtime register */
@@ -290,6 +265,7 @@ public:
         info.mode = Backend::Info::DIRECT;
         return true;
     }
+
 protected:
     /**
      @brief deinitializer.

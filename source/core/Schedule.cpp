@@ -15,10 +15,7 @@
 #include "core/Macro.h"
 #include "core/RuntimeFactory.hpp"
 #include "core/TensorUtils.hpp"
-#ifndef MNN_BUILD_MINI
 #include "shape/SizeComputer.hpp"
-#include "geometry/GeometryComputerUtils.hpp"
-#endif
 #include "utils/InitNet.hpp"
 
 //#define MNN_OPEN_TIME_TRACE
@@ -90,7 +87,7 @@ static bool _setUpTensorInfo(std::vector<std::shared_ptr<Tensor>>& tensors, cons
         TensorUtils::getDescribe(tensors[i].get())->dimensionFormat = blob->dataFormat();
         if (auto regions = des[i]->regions()) {
             auto& regs = TensorUtils::getDescribe(tensors[i].get())->regions;
-            TensorUtils::getDescribe(tensors[i].get())->memoryType = Tensor::InsideDescribe::MEMORY_BACKEND;
+            TensorUtils::getDescribe(tensors[i].get())->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
             regs.reserve(regions->size());
             for (int r = 0; r < regions->size(); r++) {
                 auto region = regions->GetAs<Region>(r);
@@ -233,7 +230,7 @@ static vector<Schedule::PipelineInfo> _scheduleUnit(const Net* net, const Schedu
     return oplists;
 }
 
-bool Schedule::schedule(ScheduleInfo& scheduleInfo, const Net* net, const std::vector<ScheduleConfig>& configs, const RuntimeInfo& runtimeInfo) {
+bool Schedule::schedule(ScheduleInfo& scheduleInfo, const Net* net, const std::vector<ScheduleConfig>& configs, const RuntimeInfo& runtimeInfo, bool netHold) {
     if (nullptr == net->oplists()) {
         MNN_PRINT("Empty net for schedule\n");
         return false;
@@ -244,7 +241,7 @@ bool Schedule::schedule(ScheduleInfo& scheduleInfo, const Net* net, const std::v
         defaultConfig.flags = 4;
         scheduleInfo.defaultBackend.reset(runtimeInfo.second->onCreate(&defaultConfig));
         ErrorCode code = NO_ERROR;
-        initConstTensors(scheduleInfo.allTensors, net, scheduleInfo.defaultBackend.get(), code);
+        initConstTensors(scheduleInfo.allTensors, net, scheduleInfo.defaultBackend.get(), netHold, code);
         if (NO_ERROR != code) {
             MNN_ERROR("Schedule Const init errorcode = %d\n", code);
             return false;
@@ -259,12 +256,7 @@ bool Schedule::schedule(ScheduleInfo& scheduleInfo, const Net* net, const std::v
         Backend::Info compute;
         compute.type      = getApprociateType(config);
         compute.numThread = config.numThread;
-        if(config.type == MNN_FORWARD_AUTO) {
-            if(compute.type == MNN_FORWARD_OPENCL || compute.type == MNN_FORWARD_METAL) {
-                // AUTO set default gpu-mode MNN_GPU_TUNING_FAST
-                compute.numThread = 16;
-            }
-        }
+        compute.gpuMode = config.gpuMode;
         compute.user      = config.backendConfig;
         auto oplists      = _scheduleUnit(net, config, allTensors);
         result.emplace_back(std::make_pair(compute, std::move(oplists)));
@@ -336,32 +328,6 @@ bool Schedule::schedule(ScheduleInfo& scheduleInfo, const Net* net, const std::v
                        std::make_pair(net->tensorName()->GetAsString(index)->c_str(), t));
         }
     }
-#ifndef MNN_BUILD_MINI
-    for (auto iter = scheduleInfo.pipelineInfo.begin(); iter != scheduleInfo.pipelineInfo.end();) {
-        auto breakIndex = GeometryComputerUtils::buildConstantTensors(iter->second);
-        if (breakIndex >= 0) {
-            scheduleInfo.needInputContentForShape = true;
-        }
-#ifdef MNN_SEPERTE_SIZE
-        if (breakIndex >= 0 && (breakIndex + 1) < iter->second.size()) {
-            // Split oplist
-            std::vector<Schedule::PipelineInfo> fuse;
-            std::vector<Schedule::PipelineInfo> separate;
-            fuse.insert(fuse.begin(), iter->second.begin(), iter->second.begin() + breakIndex + 1);
-            separate.insert(separate.begin(), iter->second.begin() + breakIndex + 1, iter->second.end());
-            oplists.clear();
-            iter->second = std::move(separate);
-            iter = scheduleInfo.pipelineInfo.insert(iter, std::make_pair(iter->first, fuse));
-            iter++;
-            iter++;
-        } else {
-            iter++;
-        }
-#else
-        iter++;
-#endif
-    }
-#endif
     return true;
 }
 } // namespace MNN
