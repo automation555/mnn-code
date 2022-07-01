@@ -112,9 +112,6 @@ struct NormalizeT;
 struct EltwiseInt8;
 struct EltwiseInt8T;
 
-struct CumSum;
-struct CumSumT;
-
 inline const flatbuffers::TypeTable *Convolution2DCommonTypeTable();
 
 inline const flatbuffers::TypeTable *Convolution3DCommonTypeTable();
@@ -182,8 +179,6 @@ inline const flatbuffers::TypeTable *PriorBoxTypeTable();
 inline const flatbuffers::TypeTable *NormalizeTypeTable();
 
 inline const flatbuffers::TypeTable *EltwiseInt8TypeTable();
-
-inline const flatbuffers::TypeTable *CumSumTypeTable();
 
 enum PadMode {
   PadMode_CAFFE = 0,
@@ -1745,10 +1740,12 @@ struct Pool3DT : public flatbuffers::NativeTable {
   PoolType type;
   PoolPadType padType;
   bool isGlobal;
+  bool ceilMode;
   Pool3DT()
       : type(PoolType_MAXPOOL),
         padType(PoolPadType_CAFFE),
-        isGlobal(false) {
+        isGlobal(false),
+        ceilMode(false) {
   }
 };
 
@@ -1775,6 +1772,9 @@ struct Pool3D FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   bool isGlobal() const {
     return GetField<uint8_t>(14, 0) != 0;
   }
+  bool ceilMode() const {
+    return GetField<uint8_t>(16, 0) != 0;
+  }
   bool Verify(flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyOffset(verifier, 4) &&
@@ -1786,6 +1786,7 @@ struct Pool3D FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
            VerifyField<int8_t>(verifier, 10) &&
            VerifyField<int8_t>(verifier, 12) &&
            VerifyField<uint8_t>(verifier, 14) &&
+           VerifyField<uint8_t>(verifier, 16) &&
            verifier.EndTable();
   }
   Pool3DT *UnPack(const flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -1814,6 +1815,9 @@ struct Pool3DBuilder {
   void add_isGlobal(bool isGlobal) {
     fbb_.AddElement<uint8_t>(14, static_cast<uint8_t>(isGlobal), 0);
   }
+  void add_ceilMode(bool ceilMode) {
+    fbb_.AddElement<uint8_t>(16, static_cast<uint8_t>(ceilMode), 0);
+  }
   explicit Pool3DBuilder(flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -1833,11 +1837,13 @@ inline flatbuffers::Offset<Pool3D> CreatePool3D(
     flatbuffers::Offset<flatbuffers::Vector<int32_t>> pads = 0,
     PoolType type = PoolType_MAXPOOL,
     PoolPadType padType = PoolPadType_CAFFE,
-    bool isGlobal = false) {
+    bool isGlobal = false,
+    bool ceilMode = false) {
   Pool3DBuilder builder_(_fbb);
   builder_.add_pads(pads);
   builder_.add_kernels(kernels);
   builder_.add_strides(strides);
+  builder_.add_ceilMode(ceilMode);
   builder_.add_isGlobal(isGlobal);
   builder_.add_padType(padType);
   builder_.add_type(type);
@@ -2090,13 +2096,11 @@ struct LRNT : public flatbuffers::NativeTable {
   int32_t localSize;
   float alpha;
   float beta;
-  float bias;
   LRNT()
       : regionType(0),
         localSize(0),
         alpha(0.0f),
-        beta(0.0f),
-        bias(1.0f) {
+        beta(0.0f) {
   }
 };
 
@@ -2117,16 +2121,12 @@ struct LRN FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   float beta() const {
     return GetField<float>(10, 0.0f);
   }
-  float bias() const {
-    return GetField<float>(12, 1.0f);
-  }
   bool Verify(flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<int32_t>(verifier, 4) &&
            VerifyField<int32_t>(verifier, 6) &&
            VerifyField<float>(verifier, 8) &&
            VerifyField<float>(verifier, 10) &&
-           VerifyField<float>(verifier, 12) &&
            verifier.EndTable();
   }
   LRNT *UnPack(const flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -2149,9 +2149,6 @@ struct LRNBuilder {
   void add_beta(float beta) {
     fbb_.AddElement<float>(10, beta, 0.0f);
   }
-  void add_bias(float bias) {
-    fbb_.AddElement<float>(12, bias, 1.0f);
-  }
   explicit LRNBuilder(flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -2169,10 +2166,8 @@ inline flatbuffers::Offset<LRN> CreateLRN(
     int32_t regionType = 0,
     int32_t localSize = 0,
     float alpha = 0.0f,
-    float beta = 0.0f,
-    float bias = 1.0f) {
+    float beta = 0.0f) {
   LRNBuilder builder_(_fbb);
-  builder_.add_bias(bias);
   builder_.add_beta(beta);
   builder_.add_alpha(alpha);
   builder_.add_localSize(localSize);
@@ -4044,71 +4039,6 @@ inline flatbuffers::Offset<EltwiseInt8> CreateEltwiseInt8(
 
 flatbuffers::Offset<EltwiseInt8> CreateEltwiseInt8(flatbuffers::FlatBufferBuilder &_fbb, const EltwiseInt8T *_o, const flatbuffers::rehasher_function_t *_rehasher = nullptr);
 
-struct CumSumT : public flatbuffers::NativeTable {
-  typedef CumSum TableType;
-  bool exclusive;
-  bool reverse;
-  CumSumT()
-      : exclusive(false),
-        reverse(false) {
-  }
-};
-
-struct CumSum FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
-  typedef CumSumT NativeTableType;
-  static const flatbuffers::TypeTable *MiniReflectTypeTable() {
-    return CumSumTypeTable();
-  }
-  bool exclusive() const {
-    return GetField<uint8_t>(4, 0) != 0;
-  }
-  bool reverse() const {
-    return GetField<uint8_t>(6, 0) != 0;
-  }
-  bool Verify(flatbuffers::Verifier &verifier) const {
-    return VerifyTableStart(verifier) &&
-           VerifyField<uint8_t>(verifier, 4) &&
-           VerifyField<uint8_t>(verifier, 6) &&
-           verifier.EndTable();
-  }
-  CumSumT *UnPack(const flatbuffers::resolver_function_t *_resolver = nullptr) const;
-  void UnPackTo(CumSumT *_o, const flatbuffers::resolver_function_t *_resolver = nullptr) const;
-  static flatbuffers::Offset<CumSum> Pack(flatbuffers::FlatBufferBuilder &_fbb, const CumSumT* _o, const flatbuffers::rehasher_function_t *_rehasher = nullptr);
-};
-
-struct CumSumBuilder {
-  flatbuffers::FlatBufferBuilder &fbb_;
-  flatbuffers::uoffset_t start_;
-  void add_exclusive(bool exclusive) {
-    fbb_.AddElement<uint8_t>(4, static_cast<uint8_t>(exclusive), 0);
-  }
-  void add_reverse(bool reverse) {
-    fbb_.AddElement<uint8_t>(6, static_cast<uint8_t>(reverse), 0);
-  }
-  explicit CumSumBuilder(flatbuffers::FlatBufferBuilder &_fbb)
-        : fbb_(_fbb) {
-    start_ = fbb_.StartTable();
-  }
-  CumSumBuilder &operator=(const CumSumBuilder &);
-  flatbuffers::Offset<CumSum> Finish() {
-    const auto end = fbb_.EndTable(start_);
-    auto o = flatbuffers::Offset<CumSum>(end);
-    return o;
-  }
-};
-
-inline flatbuffers::Offset<CumSum> CreateCumSum(
-    flatbuffers::FlatBufferBuilder &_fbb,
-    bool exclusive = false,
-    bool reverse = false) {
-  CumSumBuilder builder_(_fbb);
-  builder_.add_reverse(reverse);
-  builder_.add_exclusive(exclusive);
-  return builder_.Finish();
-}
-
-flatbuffers::Offset<CumSum> CreateCumSum(flatbuffers::FlatBufferBuilder &_fbb, const CumSumT *_o, const flatbuffers::rehasher_function_t *_rehasher = nullptr);
-
 inline Convolution2DCommonT *Convolution2DCommon::UnPack(const flatbuffers::resolver_function_t *_resolver) const {
   auto _o = new Convolution2DCommonT();
   UnPackTo(_o, _resolver);
@@ -4574,6 +4504,7 @@ inline void Pool3D::UnPackTo(Pool3DT *_o, const flatbuffers::resolver_function_t
   { auto _e = type(); _o->type = _e; };
   { auto _e = padType(); _o->padType = _e; };
   { auto _e = isGlobal(); _o->isGlobal = _e; };
+  { auto _e = ceilMode(); _o->ceilMode = _e; };
 }
 
 inline flatbuffers::Offset<Pool3D> Pool3D::Pack(flatbuffers::FlatBufferBuilder &_fbb, const Pool3DT* _o, const flatbuffers::rehasher_function_t *_rehasher) {
@@ -4590,6 +4521,7 @@ inline flatbuffers::Offset<Pool3D> CreatePool3D(flatbuffers::FlatBufferBuilder &
   auto _type = _o->type;
   auto _padType = _o->padType;
   auto _isGlobal = _o->isGlobal;
+  auto _ceilMode = _o->ceilMode;
   return MNN::CreatePool3D(
       _fbb,
       _strides,
@@ -4597,7 +4529,8 @@ inline flatbuffers::Offset<Pool3D> CreatePool3D(flatbuffers::FlatBufferBuilder &
       _pads,
       _type,
       _padType,
-      _isGlobal);
+      _isGlobal,
+      _ceilMode);
 }
 
 inline ReluT *Relu::UnPack(const flatbuffers::resolver_function_t *_resolver) const {
@@ -4723,7 +4656,6 @@ inline void LRN::UnPackTo(LRNT *_o, const flatbuffers::resolver_function_t *_res
   { auto _e = localSize(); _o->localSize = _e; };
   { auto _e = alpha(); _o->alpha = _e; };
   { auto _e = beta(); _o->beta = _e; };
-  { auto _e = bias(); _o->bias = _e; };
 }
 
 inline flatbuffers::Offset<LRN> LRN::Pack(flatbuffers::FlatBufferBuilder &_fbb, const LRNT* _o, const flatbuffers::rehasher_function_t *_rehasher) {
@@ -4738,14 +4670,12 @@ inline flatbuffers::Offset<LRN> CreateLRN(flatbuffers::FlatBufferBuilder &_fbb, 
   auto _localSize = _o->localSize;
   auto _alpha = _o->alpha;
   auto _beta = _o->beta;
-  auto _bias = _o->bias;
   return MNN::CreateLRN(
       _fbb,
       _regionType,
       _localSize,
       _alpha,
-      _beta,
-      _bias);
+      _beta);
 }
 
 inline ArgMaxT *ArgMax::UnPack(const flatbuffers::resolver_function_t *_resolver) const {
@@ -5470,35 +5400,6 @@ inline flatbuffers::Offset<EltwiseInt8> CreateEltwiseInt8(flatbuffers::FlatBuffe
       _outputQuan);
 }
 
-inline CumSumT *CumSum::UnPack(const flatbuffers::resolver_function_t *_resolver) const {
-  auto _o = new CumSumT();
-  UnPackTo(_o, _resolver);
-  return _o;
-}
-
-inline void CumSum::UnPackTo(CumSumT *_o, const flatbuffers::resolver_function_t *_resolver) const {
-  (void)_o;
-  (void)_resolver;
-  { auto _e = exclusive(); _o->exclusive = _e; };
-  { auto _e = reverse(); _o->reverse = _e; };
-}
-
-inline flatbuffers::Offset<CumSum> CumSum::Pack(flatbuffers::FlatBufferBuilder &_fbb, const CumSumT* _o, const flatbuffers::rehasher_function_t *_rehasher) {
-  return CreateCumSum(_fbb, _o, _rehasher);
-}
-
-inline flatbuffers::Offset<CumSum> CreateCumSum(flatbuffers::FlatBufferBuilder &_fbb, const CumSumT *_o, const flatbuffers::rehasher_function_t *_rehasher) {
-  (void)_rehasher;
-  (void)_o;
-  struct _VectorArgs { flatbuffers::FlatBufferBuilder *__fbb; const CumSumT* __o; const flatbuffers::rehasher_function_t *__rehasher; } _va = { &_fbb, _o, _rehasher}; (void)_va;
-  auto _exclusive = _o->exclusive;
-  auto _reverse = _o->reverse;
-  return MNN::CreateCumSum(
-      _fbb,
-      _exclusive,
-      _reverse);
-}
-
 inline const flatbuffers::TypeTable *PadModeTypeTable() {
   static const flatbuffers::TypeCode type_codes[] = {
     { flatbuffers::ET_CHAR, 0, 0 },
@@ -5964,6 +5865,7 @@ inline const flatbuffers::TypeTable *Pool3DTypeTable() {
     { flatbuffers::ET_INT, 1, -1 },
     { flatbuffers::ET_CHAR, 0, 0 },
     { flatbuffers::ET_CHAR, 0, 1 },
+    { flatbuffers::ET_BOOL, 0, -1 },
     { flatbuffers::ET_BOOL, 0, -1 }
   };
   static const flatbuffers::TypeFunction type_refs[] = {
@@ -5976,10 +5878,11 @@ inline const flatbuffers::TypeTable *Pool3DTypeTable() {
     "pads",
     "type",
     "padType",
-    "isGlobal"
+    "isGlobal",
+    "ceilMode"
   };
   static const flatbuffers::TypeTable tt = {
-    flatbuffers::ST_TABLE, 6, type_codes, type_refs, nullptr, names
+    flatbuffers::ST_TABLE, 7, type_codes, type_refs, nullptr, names
   };
   return &tt;
 }
@@ -6045,18 +5948,16 @@ inline const flatbuffers::TypeTable *LRNTypeTable() {
     { flatbuffers::ET_INT, 0, -1 },
     { flatbuffers::ET_INT, 0, -1 },
     { flatbuffers::ET_FLOAT, 0, -1 },
-    { flatbuffers::ET_FLOAT, 0, -1 },
     { flatbuffers::ET_FLOAT, 0, -1 }
   };
   static const char * const names[] = {
     "regionType",
     "localSize",
     "alpha",
-    "beta",
-    "bias"
+    "beta"
   };
   static const flatbuffers::TypeTable tt = {
-    flatbuffers::ST_TABLE, 5, type_codes, nullptr, nullptr, names
+    flatbuffers::ST_TABLE, 4, type_codes, nullptr, nullptr, names
   };
   return &tt;
 }
@@ -6485,21 +6386,6 @@ inline const flatbuffers::TypeTable *EltwiseInt8TypeTable() {
   };
   static const flatbuffers::TypeTable tt = {
     flatbuffers::ST_TABLE, 4, type_codes, type_refs, nullptr, names
-  };
-  return &tt;
-}
-
-inline const flatbuffers::TypeTable *CumSumTypeTable() {
-  static const flatbuffers::TypeCode type_codes[] = {
-    { flatbuffers::ET_BOOL, 0, -1 },
-    { flatbuffers::ET_BOOL, 0, -1 }
-  };
-  static const char * const names[] = {
-    "exclusive",
-    "reverse"
-  };
-  static const flatbuffers::TypeTable tt = {
-    flatbuffers::ST_TABLE, 2, type_codes, nullptr, nullptr, names
   };
   return &tt;
 }
