@@ -23,7 +23,7 @@ table Convolution2DCommon {
     relu6:bool=false;
     pads:[int];
     outPads:[int];
-    hasOutputShape:bool = false;
+    slope:float=0.0;
 }
 
 table Convolution3DCommon {
@@ -36,17 +36,6 @@ table Convolution3DCommon {
     outputCount:int = 0;
     relu:bool = false;
     relu6:bool = false;
-    group:int = 1;
-}
-
-enum SparseAlgo : byte {
-    RANDOM = 0,
-    SIMD_OC = 1,
-}
-
-table SparseCommon {
-    method:SparseAlgo = RANDOM;
-    args:[Attribute];
 }
 
 // idst param
@@ -87,17 +76,15 @@ table QuantizedFloatParam{
     outputZeroPoint: byte = 0;
     clampMin: byte = -128;
     clampMax: byte = 127;
-    // binary proto: [originKySize, originKxSize, transKySize, transKxSize, {kyStart, kxStart, unitY, unitX}, {...} ...]
-    winogradAttr:[int];
 }
 
 table Convolution2D {
     common:Convolution2DCommon;
     weight:[float];
     bias:[float];
+
     quanParameter:IDSTQuan;
     symmetricQuan:QuantizedFloatParam;
-    sparseParameter:SparseCommon;
 }
 
 table Convolution3D {
@@ -155,7 +142,6 @@ table Pool3D {
 
     type:PoolType;
     padType:PoolPadType;
-    isGlobal:bool=false;
 }
 
 table Relu {
@@ -181,7 +167,6 @@ table LRN {
     localSize:int;
     alpha:float;
     beta:float;
-    bias:float=1.0;
 }
 
 table ArgMax {
@@ -261,7 +246,7 @@ table Permute {
 
 table Reshape {
     dims:[int];
-    dimType: MNN_DATA_FORMAT;
+    dimType: MNN_DATA_FORMAT;    
 }
 
 table DetectionOutput {
@@ -277,13 +262,10 @@ table DetectionOutput {
     objectnessScore:float=0.01;
 }
 
-table RoiParameters {
+table RoiPooling {
     pooledWidth:int;
     pooledHeight:int;
     spatialScale:float;
-    samplingRatio:int = -1;
-    aligned:bool = false;
-    poolType:PoolType = AVEPOOL;
 }
 
 table Proposal {
@@ -353,9 +335,4 @@ table EltwiseInt8 {
     inputQuan0:QuantizedFloatParam;
     inputQuan1:QuantizedFloatParam;
     outputQuan:QuantizedFloatParam;
-}
-
-table CumSum {
-    exclusive:bool;
-    reverse:bool;
 }
