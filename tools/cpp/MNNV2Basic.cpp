@@ -54,8 +54,7 @@ using namespace MNN;
         outputOs << "\n";                                              \
     }
 
-static void dumpTensor2File(const Tensor* tensor, const char* file, std::ofstream& orderFile) {
-    orderFile << file << std::endl;
+static void dumpTensor2File(const Tensor* tensor, const char* file) {
     std::ofstream outputOs(file);
     auto type = tensor->getType();
 
@@ -80,17 +79,7 @@ static void dumpTensor2File(const Tensor* tensor, const char* file, std::ofstrea
         DUMP_CHAR_DATA(uint8_t);
     }
     if (dataType == halide_type_int && dataBytes == 1) {
-#ifdef MNN_USE_SSE
-        auto data = tensor->host<uint8_t>();
-        for (int z = 0; z < outside; ++z) {
-            for (int x = 0; x < width; ++x) {
-                outputOs << (static_cast<int>(data[x + z * width]) - 128) << "\t";
-            }
-            outputOs << "\n";
-        }
-#else
         DUMP_CHAR_DATA(int8_t);
-#endif
     }
 }
 
@@ -114,7 +103,7 @@ static inline int64_t getTimeInUs() {
 static int test_main(int argc, const char* argv[]) {
     if (argc < 2) {
         MNN_PRINT("========================================================================\n");
-        MNN_PRINT("Arguments: model.MNN runLoops runMask forwardType numberThread inputSize precision\n");
+        MNN_PRINT("Arguments: model.MNN runLoops saveAllTensors forwardType numberThread inputSize precision\n");
         MNN_PRINT("========================================================================\n");
         return -1;
     }
@@ -134,23 +123,19 @@ static int test_main(int argc, const char* argv[]) {
         runTime = ::atoi(argv[2]);
     }
 
-    int runMask = 0;
+    int saveAllTensors = 0;
     if (argc > 3) {
-        runMask = atoi(argv[3]);
+        saveAllTensors = atoi(argv[3]);
+        if (saveAllTensors) {
+            MNN_PRINT("Save AllTensors to output/*.txt\n");
+        }
     }
-    int saveOutput = 0;
-    if ((runMask & 1) || (runMask & 2)) {
-        MNN_PRINT("Save AllTensors to output/*.txt\n");
-        saveOutput = 1;
-    }
+
     int saveInput = 0;
-    if (runMask & 2) {
+    if (saveAllTensors > 1) {
         saveInput = 1;
     }
-    bool autoBackend = false;
-    if (runMask & 16) {
-        autoBackend = true;
-    }
+
     auto type = MNN_FORWARD_CPU;
     if (argc > 4) {
         type = (MNNForwardType)atoi(argv[4]);
@@ -198,19 +183,13 @@ static int test_main(int argc, const char* argv[]) {
     }
     net->setCacheFile(".tempcache");
     net->setSessionMode(Interpreter::Session_Debug);
-    if (autoBackend) {
-        net->setSessionMode(Interpreter::Session_Backend_Auto);
-        net->setSessionHint(Interpreter::MAX_TUNING_NUMBER, 15);
-    }
-    if (!inputDims.empty()) {
-        net->setSessionMode(Interpreter::Session_Resize_Defer);
-    }
 
     // create session
     MNN::ScheduleConfig config;
     config.type      = type;
     /*modeNum means gpuMode for GPU usage, Or means numThread for CPU usage.*/
     config.numThread = modeNum;
+    config.gpuMode = modeNum;
     // If type not fount, let it failed
     config.backupType = type;
     BackendConfig backendConfig;
@@ -232,15 +211,11 @@ static int test_main(int argc, const char* argv[]) {
             MNN_PRINT("===========> Resize Again...\n");
             net->resizeTensor(inputTensor, inputDims);
             net->resizeSession(session);
-            //Set when size is changed, After resizeSession
         }
     }
-    int resizeStatus = 0;
-    net->getSessionInfo(session, MNN::Interpreter::RESIZE_STATUS, &resizeStatus);
-    if (resizeStatus != 0) {
-        MNN_ERROR("Resize error, can't execute MNN\n");
-        return 0;
-    }
+    
+    //Set After resizeSession
+    net->updateCacheFile(session);
 
     float memoryUsage = 0.0f;
     net->getSessionInfo(session, MNN::Interpreter::MEMORY, &memoryUsage);
@@ -249,7 +224,6 @@ static int test_main(int argc, const char* argv[]) {
     int backendType[2];
     net->getSessionInfo(session, MNN::Interpreter::BACKENDS, backendType);
     MNN_PRINT("Session Info: memory use %f MB, flops is %f M, backendType is %d\n", memoryUsage, flops, backendType[0]);
-    // Set Other Inputs to Zero
     auto allInput = net->getSessionInputAll(session);
     for (auto& iter : allInput) {
         auto inputTensor = iter.second;
@@ -263,9 +237,7 @@ static int test_main(int argc, const char* argv[]) {
     }
     MNN_PRINT("===========> Session Resize Done.\n");
     MNN_PRINT("===========> Session Start running...\n");
-    if (type == MNN_FORWARD_CPU || (!autoBackend)) {
-        net->releaseModel();
-    }
+    net->releaseModel();
 
     // input
     auto dimType = inputTensor->getDimensionType();
@@ -325,9 +297,8 @@ static int test_main(int argc, const char* argv[]) {
         }
         inputTensor->copyFromHostTensor(&givenTensor);
     }
-    std::ofstream orderFileOs;
-    orderFileOs.open(".order");
-    if (saveOutput) {
+
+    if (saveAllTensors) {
         MNN::TensorCallBack beforeCallBack = [&](const std::vector<MNN::Tensor*>& ntensors, const std::string& opName) {
             if (!saveInput) {
                 return true;
@@ -352,7 +323,7 @@ static int test_main(int argc, const char* argv[]) {
                 MNN_PRINT("Dump %s Input, %d, %d X %d X %d X %d\n", opName.c_str(), i, tensor->width(),
                           tensor->height(), tensor->channel(), tensor->batch());
                 outputFileName << "output/Input_" << opCopyName << "_" << i;
-                dumpTensor2File(expectTensor, outputFileName.str().c_str(), orderFileOs);
+                dumpTensor2File(expectTensor, outputFileName.str().c_str());
                 delete expectTensor;
             }
             return true;
@@ -386,7 +357,7 @@ static int test_main(int argc, const char* argv[]) {
                 }
 
                 outputFileName << "output/" << opCopyName << "_" << i;
-                dumpTensor2File(expectTensor, outputFileName.str().c_str(), orderFileOs);
+                dumpTensor2File(expectTensor, outputFileName.str().c_str());
                 delete expectTensor;
             }
             return true;
@@ -403,9 +374,7 @@ static int test_main(int argc, const char* argv[]) {
         outputTensor->copyToHostTensor(&expectTensor);
         auto outputFile = pwd + "output.txt";
         if (outputTensor->size() > 0) {
-            dumpTensor2File(&expectTensor, outputFile.c_str(), orderFileOs);
-        } else {
-            MNN_ERROR("output size is 0, can't save\n");
+            dumpTensor2File(&expectTensor, outputFile.c_str());
         }
     }
     auto allOutputs = net->getSessionOutputAll(session);
@@ -416,7 +385,7 @@ static int test_main(int argc, const char* argv[]) {
             iter.second->copyToHostTensor(&expectTensor2);
             auto outputFile = pwd + "/output/" +  iter.first + ".txt";
             if (iter.second->size() > 0) {
-                dumpTensor2File(&expectTensor2, outputFile.c_str(), orderFileOs);
+                dumpTensor2File(&expectTensor2, outputFile.c_str());
             }
         }
     }
@@ -451,12 +420,6 @@ static int test_main(int argc, const char* argv[]) {
 
         if (t > 0) {
 
-            for (int i = 0; i < 3; ++i) { // warmup
-                inputTensor->copyFromHostTensor(&givenTensor);
-                net->runSessionWithCallBackInfo(session, beforeCallBack, afterCallBack, false);
-                outputTensor->copyToHostTensor(&expectTensor);
-            }
-
             std::vector<float> times(t, 0.0f);
             for (int i = 0; i < t; ++i) {
                 auto begin = getTimeInUs();
@@ -482,22 +445,14 @@ static int test_main(int argc, const char* argv[]) {
             }
 
             std::sort(allOpsTimes.begin(), allOpsTimes.end());
-            float opSum = 0;
             for (auto& iter : allOpsTimes) {
-                opSum += iter.first;
-                MNN_PRINT("%*s \t[%s] run %d average cost %f ms, %.3f %%, FlopsRate: %.3f %%\n", 50,
-                    iter.second.first.c_str(),
-                    opTypes[iter.second.first].c_str(),
-                    runTime,
-                    iter.first / (float)runTime,
-                    iter.first / sum * 100.0f,
-                    iter.second.second / sumFlops * 100.0f);
+                MNN_PRINT("%*s \t[%s] run %d average cost %f ms, %.3f %%, FlopsRate: %.3f %%\n", 50, iter.second.first.c_str(), opTypes[iter.second.first].c_str(),
+                          runTime, iter.first / (float)runTime, iter.first / sum * 100.0f,
+                          iter.second.second / sumFlops * 100.0f);
             }
-            opSum = opSum / runTime;
-            MNN_PRINT("Avg= %f ms, OpSum = %f ms min= %f ms, max= %f ms\n", sum / (float)t, opSum, *minTime, *maxTime);
+            MNN_PRINT("Avg= %f ms, min= %f ms, max= %f ms\n", sum / (float)t, *minTime, *maxTime);
         }
     }
-    net->updateCacheFile(session);
     return 0;
 }
 

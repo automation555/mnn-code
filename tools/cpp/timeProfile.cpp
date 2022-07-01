@@ -64,10 +64,10 @@ int main(int argc, const char* argv[]) {
         MNN_PRINT("%d ", dim);
     }
     MNN_PRINT("\n");
-    int threadNumber = 4;
+    int modeNum = 4;
     if (argc > 5) {
-        threadNumber = ::atoi(argv[5]);
-        MNN_PRINT("Set ThreadNumber = %d\n", threadNumber);
+        modeNum = ::atoi(argv[5]);
+        MNN_PRINT("Set modeNum = %d\n", modeNum);
     }
 
     float sparsity = 0.0f;
@@ -94,7 +94,8 @@ int main(int argc, const char* argv[]) {
     // create session
     MNN::ScheduleConfig config;
     config.type           = type;
-    config.numThread      = threadNumber;
+    config.numThread      = modeNum;
+    config.gpuMode = modeNum;
     MNN::Session* session = NULL;
     session               = net->createSession(config);
     auto inputTensor      = net->getSessionInput(session, NULL);
@@ -127,10 +128,7 @@ int main(int argc, const char* argv[]) {
         profiler->start(info);
         return true;
     };
-    auto afterCallBack = [&](const std::vector<Tensor*>& tensors, const OperatorInfo* info) {
-        for (auto o : tensors) {
-            o->wait(MNN::Tensor::MAP_TENSOR_READ, true);
-        }
+    auto afterCallBack = [&](const std::vector<Tensor*>& inputs, const OperatorInfo* info) {
         profiler->end(info);
         return true;
     };
@@ -146,7 +144,6 @@ int main(int argc, const char* argv[]) {
 #ifdef MNN_PRINT_TIME_BY_NAME
     profiler->printTimeByName(runTime);
 #endif
-    profiler->printSlowOp("Convolution", 20, 0.03f);
     profiler->printTimeByType(runTime);
     return 0;
 }
