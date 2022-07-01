@@ -22,11 +22,7 @@ public:
         auto input  = inputs[0];
         auto output = outputs[0];
         
-        auto layer = op->main_as_Pool3D();
-        auto format = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
-        // only check channel dim when global pool
-        int maxCheckDim = (layer->isGlobal() ? 1 :input->buffer().dimensions - 1);
-        for (unsigned int i = 1; i <= maxCheckDim; ++i) {
+        for (unsigned int i = 1; i < input->buffer().dimensions; ++i) {
             if (input->buffer().dim[i].extent <= 0) {
                 return false;
             }
@@ -34,6 +30,8 @@ public:
         output->buffer().dimensions = input->buffer().dimensions;
         ::memcpy(output->buffer().dim, input->buffer().dim, input->buffer().dimensions * sizeof(halide_dimension_t));
 
+        auto layer = op->main_as_Pool3D();
+        auto format = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
         if (layer->isGlobal()) {
             if (format == MNN_DATA_FORMAT_NHWC) {
                 // N [1...] C
@@ -53,7 +51,11 @@ public:
                 const int kernel = (*layer->kernels())[i], stride = (*layer->strides())[i];
                 if (layer->padType() == PoolPadType_CAFFE) {
                     int pad = (*layer->pads())[i];
-                    outputLength = (inputLength + 2 * pad - kernel) / stride + 1;
+                    if (layer->ceilMode()) {
+                        outputLength = UP_DIV(inputLength + 2 * pad - kernel, stride) + 1;
+                    } else {
+                        outputLength = (inputLength + 2 * pad - kernel) / stride + 1;
+                    }
                 } else if (layer->padType() == PoolPadType_SAME) {
                     outputLength = UP_DIV(inputLength, stride);
                 } else if (layer->padType() == PoolPadType_VALID) {
