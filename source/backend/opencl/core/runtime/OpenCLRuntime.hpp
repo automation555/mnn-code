@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include <sstream>
 #include <string>
 #include <vector>
 #include "core/Macro.h"
@@ -40,7 +41,6 @@ namespace MNN {
 enum GpuType { MALI = 0, ADRENO = 1, RADEON = 2, OTHER = 3 };
 enum GpuMemObject { AUTO = 0, BUFFER = 1, IMAGE = 2};
 enum CLTuneLevel { None = 0, Heavy = 1, Wide = 2, Normal = 3, Fast = 4};
-enum SvmType { FINE_BUFFER = 0, COARSE_BUFFER = 1, SVM_NONE = 2};
 
 class OpenCLRuntime {
 public:
@@ -66,14 +66,6 @@ public:
     GpuType getGpuType() {
         return mGpuType;
     }
-    float getCLVersion() {
-        return mCLVersion;
-    }
-#ifdef MNN_OPENCL_SVM_ENABLE
-    cl_device_svm_capabilities getSvmCapabilities() {
-        return mSvmCapabilities;
-    }
-#endif
     GpuMemObject getGpuMemType() {
         return mMemType;
     }
@@ -89,11 +81,11 @@ public:
 
     unsigned int mQueueCount = 0;
     unsigned int getQueueNum();
-    
+
     unsigned int mKernelTime = 0;
 
     std::map<std::pair<std::string, std::vector<uint32_t>>, std::pair<std::vector<uint32_t>, uint32_t>>& tunedLwsMap();
-    
+
     ::cl::Kernel buildKernel(const std::string &programName, const std::string &kernelName,
                              const std::set<std::string> &buildOptions);
 
@@ -110,7 +102,7 @@ public:
     double getQueuedTime(const cl::Event *event);
     double getSubmitTime(const cl::Event *event);
 
-    std::pair<const void*, size_t> makeCache(void* tuneInfo);
+    std::pair<const void*, size_t> makeCache();
     bool setCache(std::pair<const void*, size_t> cache);
 private:
     bool loadProgram(const std::string &programName, cl::Program *program);
@@ -122,7 +114,7 @@ private:
     std::shared_ptr<::cl::Context> mContext;
     std::shared_ptr<::cl::Device> mFirstGPUDevicePtr;
     std::shared_ptr<::cl::CommandQueue> mCommandQueuePtr;
-    std::map<std::tuple<std::string, std::string, std::string>, ::cl::Program> mBuildProgramMap;
+    std::map<std::pair<std::string, std::string>, ::cl::Program> mBuildProgramMap;
     uint64_t mGPUGlobalMemeryCacheSize;
     uint32_t mGPUComputeUnits;
     uint32_t mMaxFreq;
@@ -133,11 +125,6 @@ private:
     bool mSupportDotInt8 = false;
     bool mSupportDotAccInt8 = false;
     GpuType mGpuType;
-    float mCLVersion = 1.0f;
-
-#ifdef MNN_OPENCL_SVM_ENABLE
-    cl_device_svm_capabilities mSvmCapabilities;
-#endif
     GpuMemObject mMemType = AUTO;
     CLTuneLevel mTuneLevel = Wide;
     std::string mDeviceName;
@@ -145,7 +132,7 @@ private:
     std::string mDefaultBuildParams;
     float mFlops = 4.0f;
     bool mIsCreateError{false};
-    
+
     double mStartNanos;
     double mStopNanos;
 
