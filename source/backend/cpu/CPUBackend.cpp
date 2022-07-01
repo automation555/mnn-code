@@ -9,39 +9,34 @@
 #include "backend/cpu/CPUBackend.hpp"
 #include <cmath>
 #include <mutex>
-#include "CPUResizeCache.hpp"
 #include "core/BufferAllocator.hpp"
 #include "CPUTensorConvert.hpp"
 #include "compute/CommonOptFunction.h"
 #include "core/TensorUtils.hpp"
 #include "ThreadPool.hpp"
 #include "core/Concurrency.h"
+#include "compute/Int8FunctionsOpt.h"
 #include "CPUCast.hpp"
 #include "core/OpCommonUtils.hpp"
-#include "core/WrapExecution.hpp"
 #ifdef _OPENMP
 #include <omp.h>
 #endif // _OPENMP
 #include "backend/cpu/CPURuntime.hpp"
-#include "core/Macro.h"
-#ifdef MNN_USE_ARMV82
+#if defined(ENABLE_ARMV82) && (defined(__ANDROID__) || defined(__aarch64__))
 #include "backend/arm82/Arm82Backend.hpp"
 #endif
 #define MAX_THREAD_NUMBER 32
 #define LARGE_MEMORY 1024 * 1024 * 500
 #ifdef MNN_SUPPORT_BF16
 #include "bf16/BF16Backend.hpp"
-#include "bf16/BF16Functions.hpp"
-#endif
-
-#ifdef MNN_USE_SSE
-#include "x86_x64/AVX2Backend.hpp"
 #endif
 
 #define MNN_CPU_CHECK_NAN 1
-#define MNN_CPU_USE_DEFAULT_BACKEND 4
 namespace MNN {
 void registerCPUOps();
+#if defined(ENABLE_ARMV82) && (defined(__ANDROID__) || defined(__aarch64__))
+struct cpuinfo_arm_isa gCPUInfo;
+#endif
 
 CPURuntime::CPURuntime(const Backend::Info& info) {
     mStaticAllocator.reset(new BufferAllocator(BufferAllocator::Allocator::createDefault()));
@@ -51,14 +46,18 @@ CPURuntime::CPURuntime(const Backend::Info& info) {
     mPower   = BackendConfig::Power_Normal;
     mMemory  = BackendConfig::Memory_Normal;
     mPrecision = BackendConfig::Precision_Normal;
+    mFlags = 0;
     mFlops = MNNGetCPUFlops(mThreadNumber);
+#if defined(ENABLE_ARMV82) && (defined(__ANDROID__) || defined(__aarch64__))
+    mIsSupportDot = gCPUInfo.dot;
+    mIsSupportFp16arith = gCPUInfo.fp16arith;
+#endif
     if (info.user != nullptr) {
         mPrecision = info.user->precision;
         mPower = info.user->power;
         mMemory = info.user->memory;
         mFlags = info.user->flags;
     }
-
 #ifdef _OPENMP
     switch (mPower) {
         case BackendConfig::Power_Low:
@@ -95,55 +94,23 @@ float CPURuntime::onGetMemoryInMB() {
     auto staticMemoryInMB = mStaticAllocator->totalSize() / 1024.0f / 1024.0f;
     return staticMemoryInMB;
 }
-
 Backend* CPURuntime::onCreate(const BackendConfig* config) const {
     auto precision = mPrecision;
-    size_t flags = mFlags;
     if (nullptr != config) {
         precision = config->precision;
-        flags = config->flags;
     }
-#ifdef MNN_USE_ARMV82
-    auto core = MNNGetCoreFunctions();
-    if (core->supportFp16arith && precision == BackendConfig::Precision_Low) {
+#if defined(ENABLE_ARMV82) && (defined(__ANDROID__) || defined(__aarch64__))
+    if (mIsSupportFp16arith && precision == BackendConfig::Precision_Low) {
         return new Arm82Backend(this);
     }
 #endif
 #ifdef MNN_SUPPORT_BF16
-    if (precision == BackendConfig::Precision_Low && BF16Functions::get()) {
+    if (precision == BackendConfig::Precision_Low) {
         return new BF16Backend(this);
     }
 #endif
-    if (flags == MNN_CPU_USE_DEFAULT_BACKEND) {
-        return new CPUBackend(this, precision, MNN_FORWARD_CPU, 0);
-    }
-#ifdef MNN_USE_SSE
-    if (AVX2Backend::isValid()) {
-        return new AVX2Backend(this, flags);
-    }
-#endif
-    return new CPUBackend(this, precision, MNN_FORWARD_CPU, flags);
+    return new CPUBackend(this, precision);
 }
-
-int CPURuntime::onGetRuntimeStatus(RuntimeStatus statusEnum) const {
-    switch (statusEnum) {
-        case STATUS_SUPPORT_FP16: {
-            return MNNGetCoreFunctions()->supportFp16arith;
-            break;
-        }
-        case STATUS_SUPPORT_DOT_PRODUCT: {
-            return MNNGetCoreFunctions()->supportSDot;
-            break;
-        }
-        default: {
-            MNN_ERROR("unsupported interface");
-            break;
-        }
-    }
-
-    return 0;
-}
-
 void CPURuntime::onGabageCollect(int level) {
     mStaticAllocator->release(false);
 }
@@ -162,19 +129,21 @@ bool CPUBackend::addCreator(OpType t, Creator* c) {
     return true;
 }
 
-CPUBackend::CPUBackend(const CPURuntime* runtime, BackendConfig::PrecisionMode precision, MNNForwardType type, size_t flags) : Backend(type) {
+CPUBackend::CPUBackend(const CPURuntime* runtime, BackendConfig::PrecisionMode precision, MNNForwardType type) : Backend(type) {
     mRuntime = runtime;
+    mCheckNAN = runtime->mFlags == MNN_CPU_CHECK_NAN;
     std::shared_ptr<BufferAllocator::Allocator> defaultAlloc(BufferAllocator::Allocator::createRecurse(runtime->mStaticAllocator.get()));
     mDynamicAllocator.reset(new BufferAllocator(defaultAlloc));
     mStaticAllocator = runtime->mStaticAllocator;
     mPrecisionMode = precision;
     mCoreFunctions = MNNGetCoreFunctions();
-    mInt8CoreFunctions = MNNGetInt8CoreFunctions();
-    mCache = new CPUResizeCache;
+}
+bool CPUBackend::supportDot() const {
+    return mRuntime->mIsSupportDot;
 }
 
 CPUBackend::~CPUBackend() {
-    delete mCache;
+    // Do nothing
 }
 
 void CPUBackend::onExecuteBegin() const {
@@ -196,39 +165,13 @@ void CPUBackend::onExecuteEnd() const {
     }
 #endif
 }
-class CPUMemObj : public Backend::MemObj {
-public:
-    CPUMemObj(BufferAllocator* allocator, std::pair<void*, int> points, int size) {
-        mPoint = std::move(points);
-        mAllocator = allocator;
-        mSize = size;
-    }
-    virtual ~ CPUMemObj() {
-        mAllocator->free(mPoint);
-    }
-    inline int getSize() const {
-        return mSize;
-    }
-private:
-    BufferAllocator* mAllocator;
-    std::pair<void*, int> mPoint;
-    int mSize;
-};
 
-Backend::MemObj* CPUBackend::allocBuffer(int size, Tensor* dest, StorageType storageType) {
-    auto originMem = TensorUtils::getDescribe(dest)->mem.get();
-    if (nullptr != originMem) {
-        if (static_cast<CPUMemObj*>(originMem)->getSize() >= size) {
-            return originMem;
-        } else {
-            TensorUtils::getDescribe(dest)->mem.reset(nullptr);
-        }
-    }
+bool CPUBackend::allocBuffer(int size, Tensor* dest, StorageType storageType) {
     // MNN_PRINT("Acquire size = %d\n", size);
     if (size <= 0) {
         MNN_PRINT("Acquire buffer size = %d\n", size);
-       // MNN_ASSERT(false);
-        return nullptr;
+        MNN_ASSERT(false);
+        return false;
     }
     // if (size > LARGE_MEMORY) {
     //     MNN_PRINT("Size larger than 500 M :%d\n", size);
@@ -255,61 +198,78 @@ Backend::MemObj* CPUBackend::allocBuffer(int size, Tensor* dest, StorageType sto
     }
     if (nullptr == points.first) {
         MNN_ERROR("Alloc buffer error for cpu backend\n");
-        return nullptr;
-    }
-    Backend::MemObj* res = nullptr;
-    if (storageType == STATIC) {
-        res = new CPUMemObj(mStaticAllocator.get(), points, size);
-    } else {
-        res = new CPUMemObj(mDynamicAllocator.get(), points, size);
+        return false;
     }
     buffer.host = (uint8_t*)points.first + points.second;
     des->extra.offset = points.second;
-    return res;
+    if (buffer.type.code == halide_type_handle) {
+        // For handle we needn't recycle the buffer, use extra as hanleFreeFunction
+        ::memset(buffer.host, 0, size);
+        des->extra.handleFreeFunction = (decltype(des->extra.handleFreeFunction))free;
+    }
+    return true;
 }
 
-Backend::MemObj* CPUBackend::onAcquire(const MNN::Tensor* nativeTensorConst, StorageType storageType) {
+bool CPUBackend::onAcquireBuffer(const MNN::Tensor* nativeTensorConst, StorageType storageType) {
     if (nativeTensorConst == nullptr) {
-        return nullptr;
+        return false;
     }
     //FUNC_PRINT_ALL(nativeTensorConst, p);
     auto nativeTensor = (Tensor*)nativeTensorConst;
-    auto size = getTensorSize(nativeTensor, true);
+    auto size = nativeTensor->size();
     return allocBuffer(size, nativeTensor, storageType);
 }
 
-static bool _supportQuant(const Op* op, const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
+bool CPUBackend::onReleaseBuffer(const MNN::Tensor* nativeTensor, StorageType storageType) {
+    if (DYNAMIC_SEPERATE == storageType) {
+        return true;
+    }
+    if (nativeTensor == nullptr) {
+        return false;
+    }
+    if (nullptr == nativeTensor->buffer().host) {
+        return false;
+    }
+    auto des = TensorUtils::getDescribe(nativeTensor);
+    std::pair<void*, int> pointer;
+    pointer.second = des->extra.offset;
+    pointer.first = (uint8_t*)nativeTensor->buffer().host - des->extra.offset;
+    if (STATIC == storageType) {
+        mStaticAllocator->free(pointer);
+        return true;
+    }
+    mDynamicAllocator->free(pointer);
+    return true;
+}
+
+std::pair<float, bool> CPUBackend::onMeasure(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                                    const MNN::Op* op) {
+    auto map  = gCreator;
+    auto iter = map->find(op->type());
+    if (iter == map->end()) {
+        MNN_PRINT("Don't support type %s, %s\n", MNN::EnumNameOpType(op->type()), op->name()->c_str());
+        return std::make_pair(0.0f, false);
+    }
+    // FIXME: Compute in future
+    return std::make_pair(0.0f, false);
+}
+
+halide_type_t CPUBackend::getRunType(const Op* op, halide_type_t qtype, halide_type_t rtype) {
     auto otype = op->type();
     switch (otype) {
-        case OpType_Convolution:
-        case OpType_ConvolutionDepthwise:
-            if (op->main_as_Convolution2D() && op->main_as_Convolution2D()->weight() != nullptr) {
-                return false;
-            } else {
-                return true;
-            }
         case OpType_ConvInt8:
         case OpType_DepthwiseConvInt8:
-            return true;
+        case OpType_Convolution:
+        case OpType_ConvolutionDepthwise:
         // case OpType_Eltwise:
         case OpType_Raster:
-        {
-            for (auto& r : TensorUtils::getDescribe(inputs[0])->regions) {
-                if (TensorUtils::getDescribe(r.origin)->quantAttr.get() != TensorUtils::getDescribe(outputs[0])->quantAttr.get()) {
-                    return false;
-                }
-            }
-            return true;
-        }
+            return qtype;
         case OpType_ReLU:
-            if (TensorUtils::getDescribe(inputs[0])->quantAttr.get() != TensorUtils::getDescribe(outputs[0])->quantAttr.get()) {
-                return false;
-            }
             // now just relu without slope support quant
             if ((op->main_as_Relu() == nullptr) || op->main_as_Relu()->slope() == 0.f) {
-                return true;
+                return qtype;
             } else {
-                return false;
+                return rtype;
             }
         /*
         case OpType_Pooling:
@@ -321,12 +281,15 @@ static bool _supportQuant(const Op* op, const std::vector<Tensor*>& inputs, cons
             }
         */
         default:
-            return false;
+            return rtype;
     }
-    return false;
 }
 
-static OpType _getRealOpType(OpType opType) {
+OpType CPUBackend::getRealOpType(OpType opType, halide_type_t dataType) {
+    // now just support int8
+    if (dataType != halide_type_of<int8_t>()) {
+        return opType;
+    }
     switch (opType) {
         case OpType_Convolution:
             return OpType_ConvInt8;
@@ -343,51 +306,6 @@ static OpType _getRealOpType(OpType opType) {
             return opType;
     }
 }
-int CPUBackend::getTensorSize(const Tensor* tensor, bool multiBytes) const {
-    auto core = mCoreFunctions;
-    int dataSize = 1;
-    auto des = TensorUtils::getDescribe(tensor);
-    for (int i = 0; i < tensor->dimensions(); i++) {
-        int currentDimSize = tensor->length(i);
-        if (des->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 && 1 == i) {
-            currentDimSize = UP_DIV(currentDimSize, core->pack) * core->pack;
-        }
-        dataSize *= currentDimSize;
-    }
-    if (multiBytes) {
-        int bytes = tensor->getType().bytes();
-        if (TensorUtils::getDescribe(tensor)->quantAttr != nullptr) {
-            if (TensorUtils::getDescribe(tensor)->type == DataType_DT_FLOAT) {
-                bytes = 4;
-            } else {
-                bytes = 1;
-            }
-        }
-        return dataSize * bytes;
-    }
-    return dataSize;
-}
-
-int CPUBackend::getBytes(const Backend* backend, const Tensor* output) {
-    auto bytes = output->getType().bytes();
-    auto core = static_cast<const CPUBackend*>(backend)->functions();
-    auto quant = TensorUtils::getDescribe(output)->quantAttr.get();
-    if (output->getType().code == halide_type_float) {
-        bytes = core->bytes;
-    }
-    if (nullptr != quant && TensorUtils::getDescribe(output)->type == DataType_DT_INT8) {
-        bytes = 1;
-    }
-    return bytes;
-}
-
-DataType CPUBackend::getDataType(const Tensor* tensor) {
-    auto des = TensorUtils::getDescribe(tensor);
-    if (nullptr == des->quantAttr.get()) {
-        return DataType_DT_FLOAT;
-    }
-    return des->type;
-}
 
 /// get execution
 Execution* CPUBackend::onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
@@ -399,39 +317,32 @@ Execution* CPUBackend::onCreate(const std::vector<Tensor*>& inputs, const std::v
     if (op->type() == OpType_BatchNorm) {
         return nullptr;
     }
-    // Check if need use quant op
-    DataType runType = DataType_DT_FLOAT;
-    bool useQuant = false;
-    if (outputs.size() == 1) {
-        // Quant: output and all input has quantAttr and op support
-        if (TensorUtils::getDescribe(outputs[0])->quantAttr != nullptr) {
-            useQuant = _supportQuant(op, inputs, outputs);
-        }
-        if (useQuant) {
-            if (op->type() == OpType_Raster) {
-                for (auto& t : TensorUtils::getDescribe(inputs[0])->regions) {
-                    if (TensorUtils::getDescribe(t.origin)->quantAttr == nullptr || TensorUtils::getDescribe(t.origin)->type == DataType_DT_FLOAT) {
-                        useQuant = false;
-                        break;
-                    }
-                }
-            } else {
-                for (auto t : inputs) {
-                    if (TensorUtils::getDescribe(t)->quantAttr == nullptr) {
-                        useQuant = false;
-                        break;
-                    }
-                }
-            }
+    // get QuantType and RunType, default is float
+    halide_type_t quantType = halide_type_of<float>();
+    auto isQuant = OpCommonUtils::getQuantInfo(inputs);
+    if (isQuant.first) {
+        // if output hasnt scale, using output type
+        if (TensorUtils::getDescribe(outputs[0])->quantAttr == nullptr && !outputs.empty()) {
+            quantType = outputs[0]->getType();
+        } else {
+            quantType = TensorUtils::DataTypeToHalideType(isQuant.second);
         }
     }
+    
     auto opType = op->type();
-    if (useQuant) {
-        opType = _getRealOpType(opType);
-        runType = DataType_DT_INT8;
-        TensorUtils::getDescribe(outputs[0])->type = DataType_DT_INT8;
+    if (opType == MNN::OpType_Convolution || opType == MNN::OpType_ConvolutionDepthwise) {
+        bool notQuant = op->main_as_Convolution2D()->symmetricQuan() == nullptr;
+        if (notQuant) {
+            quantType = halide_type_of<float>();
+        }
     }
+
+    auto originType = outputs.empty() ? halide_type_of<float>() : outputs[0]->getType();
+    auto runType = getRunType(op, quantType, originType);
     // TODO: rm this convert when merge diff datatyoe of op
+    if (isQuant.first) {
+        opType = getRealOpType(opType, runType);
+    }
     auto map  = gCreator;
     auto iter = map->find(opType);
     if (iter == map->end()) {
@@ -439,40 +350,279 @@ Execution* CPUBackend::onCreate(const std::vector<Tensor*>& inputs, const std::v
         return nullptr;
     }
     Execution* exe = nullptr;
-    bool needCast = false;
-    // judge is it need CastWrap
-    if (OpType_Raster == opType) {
-        TensorUtils::getDescribe(inputs[0])->quantAttr = TensorUtils::getDescribe(outputs[0])->quantAttr;
-        for (const auto& r : TensorUtils::getDescribe(inputs[0])->regions) {
-            needCast |= getDataType(r.origin) != runType;
-        }
-    } else {
-        for (int i = 0; i < inputs.size(); i++) {
-            if (OpCommonUtils::opNeedContent(opType, i) && inputs[i]->getType() != halide_type_of<int>()) {
-                needCast |= getDataType(inputs[i]) != runType;
+    if (isQuant.first) {
+        bool needCast = false;
+        // judge is it need CastWrap
+        if (OpType_Raster == opType) {
+            inputs[0]->setType(TensorUtils::HaildeTypeToDataType(runType));
+            for (const auto& r : TensorUtils::getDescribe(inputs[0])->regions) {
+                needCast |= (r.origin->getType() != runType);
+            }
+        } else {
+            for (int i = 0; i < inputs.size(); i++) {
+                if (OpCommonUtils::opNeedContent(opType, i) && inputs[i]->getType() != halide_type_of<int>()) {
+                    needCast |= (inputs[i]->getType() != runType);
+                }
             }
         }
-    }
-    if (needCast) {
-        exe = new CastWrapExecution(iter->second, op, this, inputs, outputs, runType);
+        // set output Tensor Type
+        auto outputType = TensorUtils::HaildeTypeToDataType(runType);
+        for (auto output : outputs) {
+            if (output->getType() != runType) {
+                output->setType(outputType);
+                needCast = true;
+            }
+        }
+        if (needCast) {
+            class CastWrapExecution : public Execution {
+            public:
+                CastWrapExecution(Backend* backend, halide_type_t runT, const Op* op, std::map<const Tensor*, const Tensor*>& cachedCastTensor, Execution* exe)
+                    : Execution(backend), runType(runT), mOp(op), mCachedCastTensor(cachedCastTensor), mExecution(exe) {}
+                CastWrapExecution(const CPUBackend::Creator* creator, const Op* op, Backend* backend,
+                              const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
+                              halide_type_t runT, std::map<const Tensor*, const Tensor*>& cachedCastTensor)
+                            : Execution(backend), runType(runT), mCreator(creator), mOp(op),
+                              mCachedCastTensor(cachedCastTensor), mInputs(inputs) {
+                    std::vector<int> types(inputs.size());
+                    for (int i = 0; i < inputs.size(); i++) {
+                        types[i] = TensorUtils::HaildeTypeToDataType(inputs[i]->getType());
+                        inputs[i]->setType(TensorUtils::HaildeTypeToDataType(runType));
+                    }
+                    mExecution.reset(mCreator->onCreate(inputs, outputs, mOp, backend));
+                    for (int i = 0; i < inputs.size(); i++) {
+                        inputs[i]->setType(types[i]);
+                    }
+                }
+                virtual ErrorCode onResize(const std::vector<Tensor*>& inputs,
+                                           const std::vector<Tensor*>& outputs) override {
+                    for (auto output : outputs) {
+                        output->setType(TensorUtils::HaildeTypeToDataType(runType));
+                    }
+                    mWrapInputTensors.clear();
+                    mWrapInputs.clear();
+                    mCasts.clear();
+                    mScales.clear();
+                    std::vector<Tensor*> realInput;
+                    if (mOp->type() == OpType_Raster) {
+                        for (const auto& r : TensorUtils::getDescribe(inputs[0])->regions) {
+                            realInput.push_back(r.origin);
+                        }
+                    } else {
+                        realInput = inputs;
+                    }
+                    for (int i = 0; i < realInput.size(); i++) {
+                        auto input = realInput[i];
+                        if (input->getType() == runType || !OpCommonUtils::opNeedContent(mOp->type(), i) || input->getType() == halide_type_of<int>()) {
+                            mWrapInputs.push_back(input);
+                            continue;
+                        }
+                        if (mCachedCastTensor.find(input) != mCachedCastTensor.end()) {
+                            mWrapInputs.push_back(const_cast<Tensor*>(mCachedCastTensor[input]));
+                            continue;
+                        }
+                        std::unique_ptr<Tensor> wrapTensor(new Tensor);
+                        TensorUtils::copyShape(input, wrapTensor.get(), true);
+                        TensorUtils::setLinearLayout(wrapTensor.get());
+                        TensorUtils::getDescribe(wrapTensor.get())->quantAttr = TensorUtils::getDescribe(input)->quantAttr;
+                        wrapTensor->buffer().type = runType;
+                        bool memoryAllocSuccess = backend()->onAcquireBuffer(wrapTensor.get(), Backend::DYNAMIC);
+                        if (!memoryAllocSuccess) {
+                            return {};
+                        }
+                        mWrapInputs.push_back(wrapTensor.get());
+                        auto wrapPointer = wrapTensor.get();
+                        mCasts.insert(std::make_pair(input, wrapTensor.get()));
+                        mCachedCastTensor.insert(std::make_pair(input, wrapTensor.get()));
+                        mWrapInputTensors.emplace_back(std::move(wrapTensor));
+                        mScales[input] = std::vector<float>(4);
+                        auto& quantAttr = TensorUtils::getDescribe(input)->quantAttr;
+                        float scale = runType == halide_type_of<float>() ? quantAttr->scale : 1/quantAttr->scale;
+                        // set 4xscale for SSE compute
+                        mScales[input][0] = scale;
+                        mScales[input][1] = scale;
+                        mScales[input][2] = scale;
+                        mScales[input][3] = scale;
+                    }
+                    ErrorCode res = NO_ERROR;
+                    if (mOp->type() == OpType_Raster) {
+                        mRasterInput = inputs[0];
+                        if (mCasts.size() > 0) {
+                            mRasterInputTensor.reset(new Tensor(inputs[0], inputs[0]->getDimensionType(), false));
+                            mRasterInput = mRasterInputTensor.get();
+                            TensorUtils::getDescribe(mRasterInput)->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
+                            TensorUtils::getDescribe(mRasterInput)->regions.resize(realInput.size());
+                            for (int i = 0; i < realInput.size(); i++) {
+                                TensorUtils::getDescribe(mRasterInput)->regions[i] = TensorUtils::getDescribe(inputs[0])->regions[i];
+                                TensorUtils::getDescribe(mRasterInput)->regions[i].origin = mWrapInputs[i];
+                            }
+                        }
+                        res = mExecution->onResize({mRasterInput}, outputs);
+                    } else {
+                        res = mExecution->onResize(mWrapInputs, outputs);
+                    }
+                    for (auto& iter : mCasts) {
+                        if (TensorUtils::getDescribe(iter.first)->useCount <= 1) {
+                            backend()->onReleaseBuffer(iter.second, Backend::DYNAMIC);
+                        }
+                    }
+                    return res;
+                }
+
+                virtual ErrorCode onExecute(const std::vector<Tensor*>& inputs,
+                                            const std::vector<Tensor*>& outputs) override {
+                    for (const auto& iter : mCasts) {
+                        auto input = iter.first;
+                        auto output = iter.second;
+                        auto& quantAttr = TensorUtils::getDescribe(input)->quantAttr;
+                        MNN_ASSERT(quantAttr != nullptr);
+                        auto numberThread = ((CPUBackend*)backend())->threadNumber();
+                        if (numberThread == 1) {
+                            CPUCastCreator::cast(input, output);
+                            continue;
+                        }
+                        int size = input->elementSize();
+                        int sizeQuad = size / 16;
+                        int remain       = sizeQuad * 16;
+                        int sizeDivide = sizeQuad / numberThread;
+                        auto scale = mScales[input].data();
+                        if (runType == halide_type_of<float>()) {
+                            const auto inputDataPtr = input->host<int8_t>();
+                            auto outputDataPtr      = output->host<float>();
+                            if (sizeQuad > 0) {
+                                MNN_CONCURRENCY_BEGIN(tId, numberThread) {
+                                    int number = sizeDivide;
+                                    if (tId == numberThread - 1) {
+                                        number = sizeQuad - tId * sizeDivide;
+                                    }
+                                    const auto srcChannelPtr   = inputDataPtr + tId * sizeDivide * 16;
+                                    auto dstChannlePtr         = outputDataPtr + tId * sizeDivide * 16;
+                                    MNNInt8ScaleToFloat(dstChannlePtr, srcChannelPtr, scale, sizeDivide * 4, quantAttr->zero);
+                                }
+                                MNN_CONCURRENCY_END();
+                            }
+                            for (int i = remain; i < size; i++) {
+                                outputDataPtr[i] = (inputDataPtr[i] - quantAttr->zero) * scale[0];
+                            }
+                        } else {
+                            const auto inputDataPtr = input->host<float>();
+                            auto outputDataPtr      = output->host<int8_t>();
+                            if (sizeQuad > 0) {
+                                MNN_CONCURRENCY_BEGIN(tId, numberThread) {
+                                    int number = sizeDivide;
+                                    if (tId == numberThread - 1) {
+                                        number = sizeQuad - tId * sizeDivide;
+                                    }
+                                    const auto srcChannelPtr   = inputDataPtr + tId * sizeDivide * 16;
+                                    auto dstChannlePtr         = outputDataPtr + tId * sizeDivide * 16;
+                                    MNNFloat2Int8(srcChannelPtr, dstChannlePtr, sizeDivide * 4, scale, quantAttr->min, quantAttr->max, quantAttr->zero);
+                                }
+                                MNN_CONCURRENCY_END();
+                            }
+                            for (int i = remain; i < size; i++) {
+                                float value = std::round(inputDataPtr[i] * scale[0] + quantAttr->zero);
+                                outputDataPtr[i] = static_cast<int8_t>(std::min(std::max(value, quantAttr->min), quantAttr->max));
+                            }
+                        }
+                    }
+                    if (mOp->type() == OpType_Raster) {
+                        return mExecution->onExecute({ mRasterInput }, outputs);
+                    } else {
+                        return mExecution->onExecute(mWrapInputs, outputs);
+                    }
+                }
+                virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override {
+                    if (dst == nullptr || bn == nullptr) {
+                        return true;
+                    }
+                    Execution* exe;
+                    mExecution->onClone(bn, op, &exe);
+                    *dst = new CastWrapExecution(bn, runType, op, mCachedCastTensor, exe);
+                    return true;
+                };
+            private:
+                const Op* mOp;
+                const CPUBackend::Creator* mCreator;
+                halide_type_t runType;
+                std::shared_ptr<Execution> mExecution;
+                Tensor* mRasterInput;
+                std::vector<Tensor*> mWrapInputs, mInputs;
+                std::unique_ptr<Tensor> mRasterInputTensor;
+                std::vector<std::unique_ptr<Tensor>> mWrapInputTensors;
+                std::map<const Tensor*, const Tensor*> mCasts, &mCachedCastTensor;
+                std::map<const Tensor*, std::vector<float>> mScales;
+                bool firstResize = true;
+            };
+            exe = new CastWrapExecution(iter->second, op, this, inputs, outputs, runType, mCachedCastTensor);
+        }
     }
     if (exe == nullptr) {
         exe = iter->second->onCreate(inputs, outputs, op, this);
     }
-    for (auto o : outputs) {
-        auto quan = TensorUtils::getDescribe(o)->quantAttr;
-        if (nullptr != quan) {
-            TensorUtils::getDescribe(o)->type = runType;
-        }
-    }
     if (nullptr == exe) {
         return nullptr;
+    }
+    if (mCheckNAN) {
+        class CheckNANExecution : public Execution {
+        public:
+            CheckNANExecution(Execution* exe) : Execution(exe->backend()) {
+                mExecution.reset(exe);
+                mValid = exe->valid();
+            }
+            virtual ~CheckNANExecution() {
+                // Do nothing
+            }
+            virtual ErrorCode onResize(const std::vector<Tensor*>& inputs,
+                                       const std::vector<Tensor*>& outputs) override {
+                return mExecution->onResize(inputs, outputs);
+            }
+
+            virtual ErrorCode onExecute(const std::vector<Tensor*>& inputs,
+                                        const std::vector<Tensor*>& outputs) override {
+                for (auto tensor : inputs) {
+                    if (halide_type_float != tensor->getType().code) {
+                        return NO_ERROR;
+                    }
+                    if (TensorUtils::getDescribe(tensor)->memoryType == Tensor::InsideDescribe::MEMORY_VIRTUAL) {
+                        return NO_ERROR;
+                    }
+                    auto size = tensor->elementSize();
+                    auto ptr  = tensor->host<float>();
+                    for (int i = 0; i < size; ++i) {
+                        auto value = ptr[i];
+                        if (std::isnan(value) || std::isinf(value)) {
+                            return INVALID_VALUE;
+                        }
+                    }
+                }
+                auto code = mExecution->onExecute(inputs, outputs);
+                if (NO_ERROR != code) {
+                    return code;
+                }
+                for (auto tensor : outputs) {
+                    if (halide_type_float != tensor->getType().code) {
+                        return NO_ERROR;
+                    }
+                    auto size = tensor->elementSize();
+                    auto ptr  = tensor->host<float>();
+                    for (int i = 0; i < size; ++i) {
+                        auto value = ptr[i];
+                        if (std::isnan(value) || std::isinf(value)) {
+                            return INVALID_VALUE;
+                        }
+                    }
+                }
+                return NO_ERROR;
+            }
+
+        private:
+            std::unique_ptr<Execution> mExecution;
+        };
+        return new CheckNANExecution(exe);
     }
     return exe;
 }
 
 bool CPUBackend::onClearBuffer() {
-    mCache->reset();
     mDynamicAllocator->release(true);
     mCachedCastTensor.clear();
     return true;
@@ -500,40 +650,13 @@ void CPUBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) 
     if (nullptr == srcBuffer.host || nullptr == dstBuffer.host) {
         return;
     }
-    std::unique_ptr<Tensor> wrapTensor;
-    if (getDataType(srcTensor) != getDataType(dstTensor)) {
-        auto dimType = Tensor::CAFFE;
-        switch (TensorUtils::getDescribe(srcTensor)->dimensionFormat) {
-            case MNN_DATA_FORMAT_NCHW:
-                break;
-            case MNN_DATA_FORMAT_NC4HW4:
-                dimType = Tensor::CAFFE_C4;
-                break;
-            case MNN_DATA_FORMAT_NHWC:
-                dimType = Tensor::TENSORFLOW;
-                break;
-            default:
-                break;
-        }
-        auto convertType = CPUCastCreator::FlOAT_TO_INT8;
-        if (getDataType(srcTensor) == DataType_DT_INT8) {
-            convertType = CPUCastCreator::INT8_TO_FlOAT;
-        }
-        wrapTensor.reset(Tensor::createDevice(srcTensor->shape(), dstTensor->getType(), dimType));
-        auto dstType = getDataType(dstTensor);
-        if (dstType != DataType_DT_FLOAT) {
-            wrapTensor->setType(dstType);
-        }
-        wrapTensor->buffer().host = (uint8_t*)MNNMemoryAllocAlign(getTensorSize(wrapTensor.get()) * wrapTensor->getType().bytes(), MNN_MEMORY_ALIGN_DEFAULT);
-        TensorUtils::getDescribe(wrapTensor.get())->memoryType = Tensor::InsideDescribe::MEMORY_HOST;
-        auto code = CPUCastCreator::cast(srcTensor, wrapTensor.get(), this, convertType);
+    if (srcBuffer.type != dstBuffer.type) {
+        auto code = CPUCastCreator::cast(srcTensor, dstTensor);
         if (NO_ERROR != code) {
             MNN_ERROR("Error in CPUBackend::onCopyBuffer:cast\n");
+            return;
         }
-        srcTensor = wrapTensor.get();
-    } else if (srcTensor->getType() != dstTensor->getType()) {
-        MNN_ERROR("Input type not match session's tensor\n");
-        return;
+        srcTensor = dstTensor;
     }
     auto code = CPUTensorConverter::convert(srcTensor, dstTensor);
     if (NO_ERROR != code) {
@@ -552,20 +675,17 @@ public:
 #ifdef MNN_SUPPORT_BF16
 extern void registerBF16Backend();
 #endif
-#ifdef ENABLE_ARMV82
-extern void registerArm82RuntimeCreator();
-#endif
 void registerCPURuntimeCreator() {
     CPUBackend::initCreatorMap();
     registerCPUOps();
 #ifdef MNN_SUPPORT_BF16
     registerBF16Backend();
 #endif
-#ifdef MNN_USE_ARMV82
-    registerArm82RuntimeCreator();
-#endif
     // TODO: Merge _initCoreFunction MNNFunctionInit and cpuinfo_arm_init
     MNNCoreFunctionInit();
+#if defined(ENABLE_ARMV82) && (defined(__ANDROID__) || defined(__aarch64__))
+    cpuinfo_arm_init(&gCPUInfo);
+#endif
     MNNInsertExtraRuntimeCreator(MNN_FORWARD_CPU, new CPURuntimeCreator);
 };
 } // namespace MNN
