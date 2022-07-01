@@ -6,8 +6,8 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#ifndef MNN_Interpreter_hpp
-#define MNN_Interpreter_hpp
+#ifndef Interpreter_hpp
+#define Interpreter_hpp
 
 #include <functional>
 #include <map>
@@ -96,12 +96,6 @@ typedef std::function<bool(const std::vector<Tensor*>&, const std::string& /*opN
 typedef std::function<bool(const std::vector<Tensor*>&, const OperatorInfo*)> TensorCallBackWithInfo;
 typedef std::pair<std::map<MNNForwardType, std::shared_ptr<Runtime>>, std::shared_ptr<Runtime>> RuntimeInfo;
 
-/**
- * @brief get mnn version info.
- * @return mnn version string.
- */
-MNN_PUBLIC const char* getVersion();
-
 /** net data holder. multiple sessions could share same net. */
 class MNN_PUBLIC Interpreter {
 public:
@@ -132,19 +126,6 @@ public:
         Session_Input_Inside = 2,
         /** The input tensor is alloced by user, set input data before session resize*/
         Session_Input_User = 3,
-
-        /** The output tensor depends on session, and can't be separate used*/
-        Session_Output_Inside = 4,
-        /** The output tensor can be separated from session*/
-        Session_Output_User = 5,
-
-        /** Try Resize Session when create Session or not, default direct: */
-        Session_Resize_Direct = 6,
-        Session_Resize_Defer = 7,
-
-        /** Determine the Execution's forward type is determine by user or auto determine */
-        Session_Backend_Fix = 8, // Use the backend user set, when not support use default backend
-        Session_Backend_Auto = 9, // Auto Determine the Op type by MNN
     };
     /**
      * @brief The API shoud be called before create session.
@@ -157,10 +138,19 @@ public:
      * If the cache exist, try to load cache from file.
      * After createSession, try to save cache to file.
      * @param cacheFile      cache file name
-     * @param keySize        depercerate, for future use.
+     * @param keySize        the first `keySize` bytes used as the key to check if the `cacheFile` exists.
      */
     void setCacheFile(const char* cacheFile, size_t keySize = 128);
 
+    /**
+     * @brief The API shoud be called before create session.
+     * If the cache exist, try to load cache from buffer.
+     * @param cacheBuffer    cache buffer pointer
+     * @param bufferSize     the size of cacheBuffer.
+     * @param keySize        the first `keySize` bytes used as the key to check if the `cacheFile` exists.
+     */
+    void setCacheBuffer(const void* cacheBuffer, size_t bufferSize, size_t keySize = 128);
+    
     /**
      * @brief The API shoud be called after last resize session.
      * If resize session generate new cache info, try to rewrite cache file.
@@ -170,19 +160,9 @@ public:
      */
     ErrorCode updateCacheFile(Session *session, int flag = 0);
 
-    enum HintMode {
-        // Max Op number for async tuning
-        MAX_TUNING_NUMBER = 0,
-    };
-    /**
-     * @brief The API shoud be called before create session.
-     * @param mode      Hint type
-     * @param value     Hint value
-     */
-    void setSessionHint(HintMode mode, int value);
 public:
     /**
-     * @brief create runtimeInfo separately with schedule config.
+     * @brief create runtimeInfo seperately with schedule config.
      * @param configs session schedule configs.
      */
     static RuntimeInfo createRuntime(const std::vector<ScheduleConfig>& configs);
@@ -238,20 +218,13 @@ public:
 
     /**
      * @brief Get the model buffer for user to save
-     * @return std::make_pair(modelBuffer, modelSize).
+     * @return std::make_pair(modleBuffer, modelSize).
      * @example:
      * std::ofstream output("trainResult.alinn")
      * auto buffer = net->getModelBuffer();
      * output.write((const char*)buffer.first, buffer.second);
      */
     std::pair<const void*, size_t> getModelBuffer() const;
-
-    /**
-     * @brief Get the model's version info.
-     * @return const char* of model's version info like "2.0.0";
-     * If model is not loaded or model no version info, return "version info not found".
-     */
-    const char* getModelVersion() const;
 
     /**
      * @brief update Session's Tensor to model's Const Op
@@ -313,9 +286,6 @@ public:
 
         /** Backends in session in M, int*, length >= 1 + number of configs when create session */
         BACKENDS = 2,
-        
-        /** Resize Info, int*, 0: ready to execute, 1: need malloc, 2: need resize */
-        RESIZE_STATUS = 3,
 
         ALL
     };
@@ -373,17 +343,8 @@ public:
      */
     const char* bizCode() const;
 
-    /**
-     * @brief get model UUID
-     * @return Model UUID.
-     */
-    const char* uuid() const;
-
 private:
-    static Interpreter* createFromBufferInternal(Content* net, bool enforceAuth);
-
-    // Private method for internal use to bypass Model Auth.
-    static Interpreter* createFromFileWithoutAuth(const char* file);
+    static Interpreter* createFromBufferInternal(Content* net);
 
     Content* mNet = nullptr;
     Interpreter(Content* net);
@@ -392,8 +353,6 @@ private:
     Interpreter(const Interpreter&&) = delete;
     Interpreter& operator=(const Interpreter&) = delete;
     Interpreter& operator=(const Interpreter&&) = delete;
-
-    friend class PythonAuthByPass;
 };
 } // namespace MNN
 
