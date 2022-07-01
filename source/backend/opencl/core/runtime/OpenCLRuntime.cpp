@@ -7,13 +7,14 @@
 //
 
 #include "backend/opencl/core/runtime/OpenCLRuntime.hpp"
+#include <sys/stat.h>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 #include "core/Macro.h"
-#include "OpenCLTuneInfo.hpp"
 //#define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include "CLCache_generated.h"
@@ -65,7 +66,7 @@ OpenCLRuntime::OpenCLRuntime(const BackendConfig::PrecisionMode precision, const
                 {"Adreno (TM) 630", 42.74f},
                 {"Adreno (TM) 640", 42.74f},
             };
-        
+
             if (gFlopsMap.find(deviceName) != gFlopsMap.end()) {
                 mFlops = gFlopsMap[deviceName];
             }
@@ -78,35 +79,13 @@ OpenCLRuntime::OpenCLRuntime(const BackendConfig::PrecisionMode precision, const
             cl_int res;
             // if device is QUALCOMM's and version is 2.0 , set spacial optimized param
 
-            sscanf(deviceVersion.c_str(), "%*s%f%*s", &mCLVersion);
-            
-        #ifdef MNN_OPENCL_SVM_ENABLE
-            if(mCLVersion > 1.99f && (false == OpenCLSymbolsOperator::getOpenclSymbolsPtr()->isSvmError())) {
-                res = mFirstGPUDevicePtr->getInfo(CL_DEVICE_SVM_CAPABILITIES, &mSvmCapabilities);
-
-                if (res != CL_SUCCESS || mSvmCapabilities == 0) {
-                    MNN_PRINT("SVM capalibilties: NONE\n");
-                } else {
-                    if (mSvmCapabilities & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) {
-                        MNN_PRINT("SVM capalibilties: SVM_FINE_GRAIN_BUFFER\n");
-                        if (mSvmCapabilities & CL_DEVICE_SVM_ATOMICS) {
-                            MNN_PRINT("SVM capalibilties: SVM_ATOMICS\n");
-                        }
-                    } else if (mSvmCapabilities & CL_DEVICE_SVM_COARSE_GRAIN_BUFFER) {
-                        MNN_PRINT("SVM capalibilties: SVM_COARSE_GRAIN_BUFFER\n");
-                    }
-                }
-            }
-        #endif
-            
-            if (deviceName == "QUALCOMM Adreno(TM)") {
+            if (deviceName == "QUALCOMM Adreno(TM)" && deviceVersion.substr(0, deviceVersion.find('2')) == "OpenCL ") {
                 mGpuType = ADRENO;
-                
-                // if device is QUALCOMM's and version is 2.0 , set spacial optimized param
+
                 //if Adreno version is less than Adreno512, donot set WorkGroupAttribute option
                 std::string adrenoVersion = deviceVersion.substr(deviceVersion.size()-3);
                 //printf("Adreno Version:%s\n", adrenoVersion.c_str());
-                if(mCLVersion > 1.99f && adrenoVersion >= "512") {
+                if(adrenoVersion >= "512") {
                     isSetWorkGroupAttribute = true;
                 }
             } else if (deviceName.find("Mali") != std::string::npos) {
@@ -148,10 +127,10 @@ OpenCLRuntime::OpenCLRuntime(const BackendConfig::PrecisionMode precision, const
                 permitFloat16 = true;
             }
             mIsSupportedFP16     = mIsDeviceSupportedFP16 && permitFloat16;
-            
+
             //set gpu mode, tuning level and memory object
             setGpuMode(cl_mode);
-            
+
             if(mMemType == AUTO) {
                 if(mGpuType == MALI && precision != BackendConfig::Precision_Normal) {//buffer mode not support Normal Precision yet
                     mMemType = BUFFER;
@@ -191,32 +170,32 @@ void OpenCLRuntime::setGpuMode(const int cl_mode_num) {
     if(totalSet > 1) {
         MNN_PRINT("set both BUFFER and IMAGE mode is not permitted, please check cl_mode:%x！\n", cl_mode_num);
     }
-    
+
     totalSet = 0;
     isSet = (cl_mode_num & MNN_GPU_TUNING_NONE);
     if(isSet) {
         mTuneLevel = None;
         totalSet++;
     }
-    
+
     isSet = (cl_mode_num & MNN_GPU_TUNING_FAST);
     if(isSet) {
         mTuneLevel = Fast;
         totalSet++;
     }
-    
+
     isSet = (cl_mode_num & MNN_GPU_TUNING_NORMAL);
     if(isSet) {
         mTuneLevel = Normal;
         totalSet++;
     }
-    
+
     isSet = (cl_mode_num & MNN_GPU_TUNING_HEAVY);
     if(isSet) {
         mTuneLevel = Heavy;
         totalSet++;
     }
-    
+
     isSet = (cl_mode_num & MNN_GPU_TUNING_WIDE);
     if(isSet) {
         mTuneLevel = Wide;
@@ -363,7 +342,7 @@ cl::Kernel OpenCLRuntime::buildKernel(const std::string &programName, const std:
     } else {
         buildOptionsStr = "-DFLOAT=float -DFLOAT4=float4 -DFLOAT8=float8 -DRI_F=read_imagef -DFLOAT16=float16 -DWI_F=write_imagef -DCONVERT_FLOAT4=convert_float4";
     }
-    
+
     if(isSetWorkGroupAttribute) {
         buildOptionsStr += " -DSET_ATTRIBUTE=true";
     } else {
@@ -373,7 +352,7 @@ cl::Kernel OpenCLRuntime::buildKernel(const std::string &programName, const std:
         buildOptionsStr += " " + option;
     }
     buildOptionsStr += mDefaultBuildParams;
-    auto key = std::make_tuple(programName, kernelName, buildOptionsStr);
+    auto key = std::make_pair(programName, buildOptionsStr);
 
     auto buildProgramInter = mBuildProgramMap.find(key);
     cl::Program program;
@@ -407,22 +386,11 @@ uint64_t OpenCLRuntime::GetKernelWaveSize(const cl::Kernel &kernel) {
 }
 
 std::vector<uint32_t> OpenCLRuntime::getMaxWorkItemSizes() {
-    int dims = 3;
-    cl_int res = mFirstGPUDevicePtr->getInfo(CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS, &dims);
-    MNN_CHECK_CL_SUCCESS(res, "DeviceGetInfo");
-
-    if(dims < 3) {
-        std::vector<uint32_t> workItem(3, 8);
-        return workItem;
-    }
-    
-    cl::vector<cl::size_type> _workItems(dims, 1);
-    res = mFirstGPUDevicePtr->getInfo(CL_DEVICE_MAX_WORK_ITEM_SIZES, &_workItems);
-    MNN_CHECK_CL_SUCCESS(res, "DeviceGetInfo");
-    
-    std::vector<uint32_t> workItems(dims, 1);
-    for (int i = 0; i < dims; ++i) {
-        workItems[i] = _workItems[i];
+    cl::vector<cl::size_type> _workItems;
+    mFirstGPUDevicePtr->getInfo(CL_DEVICE_MAX_WORK_ITEM_SIZES, &_workItems);
+    std::vector<uint32_t> workItems;
+    for (int i = 0; i < _workItems.size(); ++i) {
+        workItems.push_back(_workItems[i]);
     }
     return workItems;
 }
@@ -452,13 +420,11 @@ double OpenCLRuntime::getSubmitTime(const cl::Event *event){
 }
 
 
-std::pair<const void*, size_t> OpenCLRuntime::makeCache(void* tuneInfo) {
-    auto tune = reinterpret_cast<MNN::OpenCL::TuneInfo*>(tuneInfo);
-    std::unique_ptr<CacheT> cache(new CacheT);
-    for (auto& p : tune->mInfos) {
-        cache->tuned.emplace_back(std::move(p));
+std::pair<const void*, size_t> OpenCLRuntime::makeCache() {
+    if (nullptr != mCacheOutside) {
+        return std::make_pair(mCacheOutside, mCacheOutsideSize);
     }
-    tune->mInfos.clear();
+    std::unique_ptr<CacheT> cache(new CacheT);
     // Get All program's binary
     for (auto& iter : mBuildProgramMap) {
         std::unique_ptr<ShaderT> pro(new ShaderT);
@@ -467,16 +433,12 @@ std::pair<const void*, size_t> OpenCLRuntime::makeCache(void* tuneInfo) {
         auto devices = program.getInfo<CL_PROGRAM_DEVICES>();
         auto binSizes = program.getInfo<CL_PROGRAM_BINARY_SIZES>();
         if (binSizes.empty() || devices.empty()) {
-            MNN_ERROR("Can't load binary, binarySize:%lu, deviceSize:%lu\n", binSizes.size(), devices.size());
+            MNN_ERROR("Can't load binary, binarySize:%d, deviceSize:%d\n", binSizes.size(), devices.size());
             continue;
         }
         // Only use first one
-        pro->program = std::get<0>(iter.first);
-        pro->kernel = std::get<1>(iter.first);
-        pro->buildInfo = std::get<2>(iter.first);
-        
-        //MNN_PRINT("%s - %s - %s\n", pro->program.c_str(), pro->kernel.c_str(), pro->buildInfo.c_str());
-        
+        pro->key = iter.first.first;
+        pro->buildInfo = iter.first.second;
         pro->buffer.resize(binSizes[0]);
         auto proRaw = program.get();
         auto c = pro->buffer.data();
@@ -508,44 +470,41 @@ bool OpenCLRuntime::setCache(std::pair<const void*, size_t> cache) {
         mBuffer.clear();
         return true;
     }
-
+    bool ret = true;
     mCacheOutsideSize = cache.second;
     mCacheOutside = cache.first;
     auto cacheBuffer = GetCache(cache.first);
-    
-    if(nullptr == cacheBuffer->programs() && nullptr == cacheBuffer->tunings()) {
-        return false;
-    }
-    
     // Load Program
     if (nullptr != cacheBuffer->programs()) {
         auto programs = cacheBuffer->programs();
         for (int i=0; i<programs->size(); ++i) {
             auto shaderInfo = programs->GetAs<Shader>(i);
-            if (nullptr == shaderInfo->program() || nullptr == shaderInfo->kernel() || nullptr == shaderInfo->buildInfo() || nullptr == shaderInfo->buffer()) {
-                MNN_ERROR("Invalid Cache\n");
-                return false;
+            if (nullptr == shaderInfo->key() || nullptr == shaderInfo->buffer()) {
+                continue;
             }
-            auto program = shaderInfo->program()->str();
-            auto kernel = shaderInfo->kernel()->str();
-            // Builder Info
-            std::string buildinfo = shaderInfo->buildInfo()->str();
-            
+            auto key = shaderInfo->key()->str();
+            // Builder Info may be empty
+            std::string buildinfo;
+            if (shaderInfo->buildInfo()) {
+                buildinfo = shaderInfo->buildInfo()->str();
+            }
             auto buffer = shaderInfo->buffer()->data();
             size_t bufferSize = shaderInfo->buffer()->size();
             auto deviceId = mFirstGPUDevicePtr->get();
             auto programRaw = clCreateProgramWithBinary(context().get(), 1, &deviceId, &bufferSize, (const unsigned char**)(&buffer), nullptr, nullptr);
             if (!programRaw) {
-                MNN_ERROR("Can't load %s - %s - %s load program\n", program.c_str(), kernel.c_str(), buildinfo.c_str());
-                return false;
+                MNN_ERROR("Can't load %s - %s load program\n", key.c_str(), buildinfo.c_str());
+                ret = false;
+                continue;
             }
             auto pro = cl::Program(programRaw);
             auto res = buildProgram(buildinfo, &pro);
             if (!res) {
-                MNN_ERROR("Can't build %s - %s - %s load program\n", program.c_str(),  kernel.c_str(), buildinfo.c_str());
-                return false;
+                MNN_ERROR("Can't build %s - %s load program\n", key.c_str(), buildinfo.c_str());
+                ret = false;
+                continue;
             }
-            mBuildProgramMap.insert(std::make_pair(std::make_tuple(program, kernel, buildinfo), pro));
+            mBuildProgramMap.insert(std::make_pair(std::make_pair(key, buildinfo), pro));
         }
     }
 
@@ -556,7 +515,8 @@ bool OpenCLRuntime::setCache(std::pair<const void*, size_t> cache) {
             auto tun = tuningInfo->GetAs<Autotuning>(i);
             if (nullptr == tun->gloablSize() || nullptr == tun->localSize() || nullptr == tun->key()) {
                 MNN_ERROR("Error tunning info\n");
-                return false;
+                ret = false;
+                continue;
             }
             std::vector<uint32_t> glo(tun->gloablSize()->size());
             for (int v=0; v<glo.size(); ++v) {
@@ -570,7 +530,7 @@ bool OpenCLRuntime::setCache(std::pair<const void*, size_t> cache) {
             mTunedLws.insert(std::make_pair(std::make_pair(tun->key()->str(), glo), std::make_pair(loc, cost)));
         }
     }
-    return true;
+    return ret;
 }
 
 } // namespace MNN
